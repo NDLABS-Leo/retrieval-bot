@@ -72,7 +72,7 @@ type DBClaim struct {
 	TermMax    int64          `bson:"term_max"`
 	TermStart  int64          `bson:"term_start"`
 	Sector     uint64         `bson:"sector"`
-	MinerAddr  string         `bson:"miner_addr,omitempty"` // 例如 f0<providerID>；或基于 ID 地址
+	MinerAddr  string         `bson:"miner_addr,omitempty"` // 例如 f0<providerID>
 	UpdatedAt  time.Time      `bson:"updated_at"`
 	Meta       map[string]any `bson:"meta,omitempty"`
 }
@@ -99,12 +99,11 @@ func connectMongo(ctx context.Context, uri, db, coll string) (*mongo.Client, *mo
 	c := mc.Database(db).Collection(coll)
 
 	// 业务唯一键：避免重复（增量）
-	// 唯一索引：(provider_id, data_cid, sector, term_start)
 	_, _ = c.Indexes().CreateOne(ctx, mongo.IndexModel{
 		Keys:    bson.D{{Key: "provider_id", Value: 1}, {Key: "data_cid", Value: 1}, {Key: "sector", Value: 1}, {Key: "term_start", Value: 1}},
 		Options: options.Index().SetUnique(true).SetName("uniq_claim_tuple"),
 	})
-	// 兼容旧逻辑（若你仍需要通过全量 claim_id 做去重，可保留此唯一索引）
+	// 兼容：全量 claim_id 唯一（可选）
 	_, _ = c.Indexes().CreateOne(ctx, mongo.IndexModel{
 		Keys:    bson.D{{Key: "provider_id", Value: 1}, {Key: "claim_id", Value: 1}},
 		Options: options.Index().SetUnique(true).SetSparse(true).SetName("uniq_provider_claimid"),
@@ -179,7 +178,7 @@ func crawlOnce(ctx context.Context, api v1api.FullNode, coll *mongo.Collection) 
 				ClaimID:    int64(claimID),
 				ProviderID: int64(providerID),
 				ClientID:   int64(c.Client),
-				ClientAddr: "", // 可选：如需可再补 StateAccountKey
+				ClientAddr: "",
 				DataCID:    c.Data.String(),
 				Size:       int64(c.Size),
 				TermMin:    int64(c.TermMin),
@@ -189,7 +188,6 @@ func crawlOnce(ctx context.Context, api v1api.FullNode, coll *mongo.Collection) 
 				MinerAddr:  idAddr.String(),
 				UpdatedAt:  time.Now(),
 			}
-			// 兼容：优先业务唯一键防重；若 claim_id 唯一键存在也会命中
 			filter := bson.M{
 				"provider_id": doc.ProviderID,
 				"data_cid":    doc.DataCID,
@@ -262,15 +260,12 @@ func setFullImportDone(ctx context.Context, db *mongo.Database, done bool) error
 	return err
 }
 
-/********** 增量：通过 StateReplay 扫 ExecutionTrace 的内部调用 **********/
+/********** 增量：通过 SearchMsg + Replay，遍历 ExecutionTrace 内部调用 **********/
+const claimAllocationsMethodNum = abi.MethodNum(9) // VerifiedRegistry.ClaimAllocations
 
-// VerifiedRegistry.ClaimAllocations 的方法号（在 v9+ 一直是 9）
-const claimAllocationsMethodNum = abi.MethodNum(9)
-
-// 从 StateDecodeParams 的 JSON 中尽量判断方法名
 func methodNameFromDecodeJSON(decStr string) string {
 	s := strings.ToLower(decStr)
-	if strings.Contains(s, "claimallocations") { // 常见
+	if strings.Contains(s, "claimallocations") {
 		return "ClaimAllocations"
 	}
 	if strings.Contains(s, "claim") && strings.Contains(s, "alloc") {
@@ -278,7 +273,6 @@ func methodNameFromDecodeJSON(decStr string) string {
 	}
 	return ""
 }
-
 func decodeParamsToString(v interface{}) string {
 	switch val := v.(type) {
 	case string:
@@ -286,7 +280,6 @@ func decodeParamsToString(v interface{}) string {
 	case []byte:
 		return string(val)
 	default:
-		// 兜底转 JSON 字符串
 		bz, err := json.Marshal(val)
 		if err != nil {
 			return fmt.Sprintf("%v", val)
@@ -294,8 +287,6 @@ func decodeParamsToString(v interface{}) string {
 		return string(bz)
 	}
 }
-
-// 判断是否是 ClaimAllocations：先试图从 decode 名称判断，失败则回退方法号=9
 func isClaimAllocations(ctx context.Context, api v1api.FullNode,
 	to address.Address, method abi.MethodNum, params []byte, tsk types.TipSetKey) (bool, string) {
 
@@ -304,9 +295,7 @@ func isClaimAllocations(ctx context.Context, api v1api.FullNode,
 	}
 	decStr, err := api.StateDecodeParams(ctx, to, method, params, tsk)
 	if err == nil && decStr != "" {
-		desStr := decodeParamsToString(decStr)
-
-		if methodNameFromDecodeJSON(desStr) == "ClaimAllocations" {
+		if methodNameFromDecodeJSON(decodeParamsToString(decStr)) == "ClaimAllocations" {
 			return true, "name"
 		}
 	}
@@ -316,7 +305,6 @@ func isClaimAllocations(ctx context.Context, api v1api.FullNode,
 	return false, ""
 }
 
-// 宽松地从 decode JSON 里提取 claims 数组（不同版本 JSON 结构不一致）
 type claimJSON struct {
 	Provider  uint64 `json:"Provider"`
 	Client    uint64 `json:"Client"`
@@ -345,11 +333,8 @@ func parseClaimAllocationsParamsFromDecode(
 	if err := json.Unmarshal([]byte(desStr), &raw); err != nil {
 		return nil, fmt.Errorf("decode json: %w", err)
 	}
-
-	// 寻找 claims 数组字段：claims / Claims / params.claims / params.Claims
 	var arr any
-	keys := []string{"claims", "Claims"}
-	for _, k := range keys {
+	for _, k := range []string{"claims", "Claims"} {
 		if v, ok := raw[k]; ok {
 			arr = v
 			break
@@ -357,7 +342,7 @@ func parseClaimAllocationsParamsFromDecode(
 	}
 	if arr == nil {
 		if p, ok := raw["params"].(map[string]any); ok {
-			for _, k := range keys {
+			for _, k := range []string{"claims", "Claims"} {
 				if v, ok2 := p[k]; ok2 {
 					arr = v
 					break
@@ -366,18 +351,15 @@ func parseClaimAllocationsParamsFromDecode(
 		}
 	}
 	if arr == nil {
-		// 没有 claims 字段，视为没有可解析的 Claim
 		return nil, nil
 	}
-
 	bz, _ := json.Marshal(arr)
 	var list []claimJSON
 	if err := json.Unmarshal(bz, &list); err != nil {
-		return nil, fmt.Errorf("claims array json: %w\nraw=%s", err, decStr)
+		return nil, fmt.Errorf("claims array json: %w raw=%s", err, desStr)
 	}
-
-	out := make([]DBClaim, 0, len(list))
 	now := time.Now()
+	out := make([]DBClaim, 0, len(list))
 	for _, c := range list {
 		out = append(out, DBClaim{
 			ProviderID: int64(c.Provider),
@@ -395,7 +377,6 @@ func parseClaimAllocationsParamsFromDecode(
 	return out, nil
 }
 
-// 使用业务唯一键做 upsert 去重
 func upsertClaims(ctx context.Context, coll *mongo.Collection, claims []DBClaim) (int64, error) {
 	if len(claims) == 0 {
 		return 0, nil
@@ -423,7 +404,7 @@ func upsertClaims(ctx context.Context, coll *mongo.Collection, claims []DBClaim)
 	return inserted, nil
 }
 
-// 递归遍历 ExecutionTrace，查找内部调用
+// 递归遍历 ExecutionTrace
 func walkExecTraceForClaims(
 	ctx context.Context,
 	api v1api.FullNode,
@@ -433,7 +414,6 @@ func walkExecTraceForClaims(
 ) (int64, error) {
 	var total int64
 
-	// 当前节点
 	if t.Msg.To == builtin.VerifiedRegistryActorAddr {
 		ok, _ := isClaimAllocations(ctx, api, t.Msg.To, t.Msg.Method, t.Msg.Params, tsk)
 		if ok {
@@ -452,7 +432,6 @@ func walkExecTraceForClaims(
 		}
 	}
 
-	// 子调用递归
 	for _, child := range t.Subcalls {
 		n, err := walkExecTraceForClaims(ctx, api, coll, tsk, child)
 		if err != nil {
@@ -463,30 +442,32 @@ func walkExecTraceForClaims(
 	return total, nil
 }
 
-// 扫描一个消息（BLS 或 SECP），通过 StateReplay 获取 ExecutionTrace 并递归查找 ClaimAllocations
 func scanOneMessageForClaims(
 	ctx context.Context,
 	api v1api.FullNode,
 	coll *mongo.Collection,
-	tsk types.TipSetKey,
+	_ types.TipSetKey, // 未使用（我们用 SearchMsg 的 TipSet）
 	msgCid cid.Cid,
 ) (int64, error) {
-	tr, err := api.StateReplay(ctx, tsk, msgCid) // v1.23 签名：Replay(ctx, tsk, mcid)
-	if err != nil {
-		return 0, fmt.Errorf("StateReplay: %w", err)
+	// 先用 SearchMsg 找到这条消息所在 TipSet
+	lookup, err := api.StateSearchMsg(ctx, types.EmptyTSK, msgCid, 200000, true)
+	if err != nil || lookup == nil {
+		return 0, err
 	}
-	if tr == nil {
-		return 0, nil
+	// 然后在该 TipSet 上 Replay
+	tr, err := api.StateReplay(ctx, lookup.TipSet, msgCid)
+	if err != nil || tr == nil {
+		return 0, err
 	}
-	return walkExecTraceForClaims(ctx, api, coll, tsk, tr.ExecutionTrace)
+	return walkExecTraceForClaims(ctx, api, coll, lookup.TipSet, tr.ExecutionTrace)
 }
 
-/********** 增量主循环（按高度） **********/
+/********** 增量主循环（按高度；SafeDelay=60；SearchMsg+Replay） **********/
 type incCfg struct {
-	PollEvery       time.Duration // 轮询间隔（<30s，含抖动）
-	SafeDelay       int64         // 与链头保持的安全延迟（避免重组）
-	BackfillStart   int64         // 没有 last_height 时，向后回补的高度窗口
-	MaxHeightsBatch int64         // 单轮最多处理的高度数量
+	PollEvery       time.Duration
+	SafeDelay       int64
+	BackfillStart   int64
+	MaxHeightsBatch int64
 }
 
 func runIncrementalLoop(
@@ -505,9 +486,7 @@ func runIncrementalLoop(
 
 	tick := time.NewTicker(cfg.PollEvery)
 	defer tick.Stop()
-
 	jitter := func() time.Duration {
-		// -30% ~ +30% 抖动
 		r := (rand.Float64()*0.6 - 0.3)
 		return time.Duration(float64(cfg.PollEvery) * r)
 	}
@@ -526,7 +505,7 @@ func runIncrementalLoop(
 				continue
 			}
 			curH := int64(tip.Height())
-			target := curH - cfg.SafeDelay
+			target := curH - cfg.SafeDelay // ← 与头部回退 60 个高度
 			if target < 0 {
 				continue
 			}
@@ -565,45 +544,23 @@ func runIncrementalLoop(
 				}
 
 				var insertedThisHeight int64
-
 				for _, bh := range ts.Blocks() {
 					bm, err := api.ChainGetBlockMessages(ctx, bh.Cid())
 					if err != nil {
 						log.Warnw("ChainGetBlockMessages", "height", h, "block", bh.Cid().String(), "err", err)
 						continue
 					}
-
-					// Replay 需要消息 CID。api.BlockMessages.Cids 顺序通常是 BLS 在前、SECP 在后。
-					// 保险起见可按顺序对应扫描：
-					idx := 0
-					// BLS
-					for range bm.BlsMessages {
-						if idx >= len(bm.Cids) {
-							break
-						}
-						cid := bm.Cids[idx]
-						n, err := scanOneMessageForClaims(ctx, api, claimsColl, ts.Key(), cid)
+					// 直接对所有 CIDs 逐一 SearchMsg + Replay
+					for _, mcid := range bm.Cids {
+						n, err := scanOneMessageForClaims(ctx, api, claimsColl, ts.Key(), mcid)
 						if err != nil {
-							log.Warnw("replay(BLS) failed", "height", h, "msg", cid.String(), "err", err)
+							// 常见：消息未入链/替换等情况
+							log.Debugw("replay failed", "height", h, "msg", mcid.String(), "err", err)
+							continue
 						}
 						insertedThisHeight += n
-						idx++
-					}
-					// SECP
-					for range bm.SecpkMessages {
-						if idx >= len(bm.Cids) {
-							break
-						}
-						cid := bm.Cids[idx]
-						n, err := scanOneMessageForClaims(ctx, api, claimsColl, ts.Key(), cid)
-						if err != nil {
-							log.Warnw("replay(SECP) failed", "height", h, "msg", cid.String(), "err", err)
-						}
-						insertedThisHeight += n
-						idx++
 					}
 				}
-
 				deltaInserted += insertedThisHeight
 				processedTo = h
 			}
@@ -619,7 +576,7 @@ func runIncrementalLoop(
 	}
 }
 
-/********** 启动引导：只在需要时全量，否则直接增量 **********/
+/********** 启动引导 **********/
 func bootstrapAndStart(
 	ctx context.Context,
 	api v1api.FullNode,
@@ -707,9 +664,10 @@ func main() {
 	}
 	defer mc.Disconnect(ctx)
 
+	// 增量配置：高度向头部回退 60（约 30 分钟安全缓冲）
 	bootstrapAndStart(ctx, full, mc.Database(cfg.MongoDB), claimsColl, crawlOnce, incCfg{
 		PollEvery:       15 * time.Second, // < 30s，带抖动
-		SafeDelay:       1,                // 与头部保持 1 个 Epoch 安全延迟
+		SafeDelay:       60,               // ← 回退 60 个高度
 		BackfillStart:   120,              // 无 last_height 时回补约 1h
 		MaxHeightsBatch: 180,              // 单轮最多处理 180 个高度
 	})
