@@ -23,59 +23,122 @@ import (
 
 var logger = logging.Logger("filplus-integration")
 
+// ---- 日志初始化 ----
+func init() {
+	logging.SetupLogging(logging.Config{
+		Format: logging.PlaintextOutput, // 或 logging.ColorizedOutput / logging.JSONOutput
+		Level:  logging.LevelInfo,       // 默认级别
+		Stdout: true,                    // 输出到 stdout
+		Stderr: false,                   // 不要 stderr，避免 nohup 里乱码
+		File:   "",                      // 不直接写文件
+		Labels: map[string]string{"app": "filplus-integration"},
+	})
+
+	logger.Info("logger initialized: output=stdout")
+}
+
 func main() {
+	startBoot := time.Now()
+	logger.Info("starting FilPlusIntegration bootstrap...")
+
 	filplus := NewFilPlusIntegration()
 
-	// 随机种子：放到 for 外，只播一次即可
-	rand.Seed(time.Now().UnixNano())
+	logger.With(
+		"queueDB", env.GetRequiredString(env.QueueMongoDatabase),
+		"marketDB", env.GetRequiredString(env.StatemarketdealsMongoDatabase),
+		"resultDB", env.GetRequiredString(env.ResultMongoDatabase),
+		"batchSize", filplus.batchSize,
+	).Info("FilPlusIntegration initialized")
+
+	logger.With("elapsed", time.Since(startBoot)).Info("bootstrap finished")
 
 	for {
+		loopStart := time.Now()
+
 		// Step 1: 已在函数内完成“按 client_addr+miner_addr 分组，并且每组只保留前 30%”
+		logger.Info("aggregating claims into client+provider groups (each group keep top 30% by claim_id)...")
 		dealsGrouped, err := getDealsGroupedByClientProvider(filplus.marketDealsCollection)
 		if err != nil {
-			logger.Error(err)
+			logger.With("err", err).Error("grouping claims failed")
+			time.Sleep(5 * time.Second)
 			continue
 		}
+		logger.With("elapsed", time.Since(loopStart)).Info("aggregation done")
+		logger.Infof("grouped clients: %d", len(dealsGrouped))
 
-		start := time.Now()
+		// 统计一下总条数（截取30%后）
+		var totalAfterPick int
+		var totalGroups int
+		for _, providerDeals := range dealsGrouped {
+			for _, deals := range providerDeals {
+				totalGroups++
+				totalAfterPick += len(deals)
+			}
+		}
+		logger.With(
+			"groups", totalGroups,
+			"claims_after_top30", totalAfterPick,
+		).Info("grouping summary")
 
-		// Step 2: 直接在每组里做随机抽样（最多 100 条），不再截取 30%
+		// Step 2: 每组里做随机抽样（最多 100 条）
+		logger.Info("sampling up to 100 items per group and enqueue tasks...")
+		enqueueStart := time.Now()
+		enqueuedTotal := 0
+
 		for client, providerDeals := range dealsGrouped {
 			for provider, deals := range providerDeals {
 				if len(deals) == 0 {
 					continue
 				}
 
-				// 随机抽样至多 100 条
 				sampleCount := 100
 				if len(deals) < sampleCount {
 					sampleCount = len(deals)
 				}
 
 				// 就地打乱，然后取前 sampleCount
-				// 为避免修改原切片内容，如需保留原顺序可先拷贝一份
 				shuffled := make([]model.DBClaim, len(deals))
 				copy(shuffled, deals)
 				rand.Shuffle(len(shuffled), func(i, j int) { shuffled[i], shuffled[j] = shuffled[j], shuffled[i] })
-
 				sampledDeals := shuffled[:sampleCount]
 
 				if err := filplus.RunOnce(context.TODO(), sampledDeals); err != nil {
-					logger.Error(err)
+					logger.With(
+						"client", client,
+						"provider", provider,
+						"count", len(sampledDeals),
+						"err", err,
+					).Error("RunOnce failed")
+				} else {
+					enqueuedTotal += len(sampledDeals)
 				}
 
-				// 日志
-				logger.Infof("Client: %s, Provider: %s, Sampled Claims: %d", client, provider, len(sampledDeals))
+				logger.With(
+					"client", client,
+					"provider", provider,
+					"sampled", len(sampledDeals),
+				).Info("group sampled & enqueued")
+
 				for _, deal := range sampledDeals {
-					logger.Infof("DataCID: %s, Size: %d, Sector: %d", deal.DataCID, deal.Size, deal.Sector)
+					logger.With(
+						"client", client,
+						"provider", provider,
+						"cid", deal.DataCID,
+						"size", deal.Size,
+						"sector", deal.Sector,
+						"claim_id", deal.ClaimID,
+					).Debug("sampled deal")
 				}
 			}
 		}
 
-		elapsed := time.Since(start)
-		logger.Infof("Processing dealsGrouped took: %s", elapsed)
+		logger.With(
+			"enqueued_total", enqueuedTotal,
+			"elapsed", time.Since(enqueueStart),
+		).Info("sampling+enqueue finished")
 
-		// 如需节流，打开 sleep
+		logger.With("loop_elapsed", time.Since(loopStart)).Info("loop finished")
+		// 可以适当节流
 		// time.Sleep(time.Minute)
 	}
 }
@@ -98,8 +161,6 @@ type FilPlusIntegration struct {
 }
 
 func GetTotalPerClient(ctx context.Context, marketDealsCollection *mongo.Collection) (map[string]int64, error) {
-	// 以 DBClaim 结构计算：按 client_addr 分组，合计 size。
-	// 过滤逻辑参考：term_start > 0 且 (term_start + term_max) > nowEpoch（仍在有效期内）
 	nowEpoch := model.TimeToEpoch64(time.Now().UTC())
 
 	var result []TotalPerClient
@@ -125,68 +186,70 @@ func GetTotalPerClient(ctx context.Context, marketDealsCollection *mongo.Collect
 		},
 	})
 	if err != nil {
-		return nil, errors.Wrap(err, "failed to aggregate market claims")
+		return nil, errors.Wrap(err, "aggregate market claims")
 	}
 
 	err = agg.All(ctx, &result)
 	if err != nil {
-		return nil, errors.Wrap(err, "failed to decode market claims")
+		return nil, errors.Wrap(err, "decode market claims")
 	}
 
-	totalPerClient := make(map[string]int64)
+	totalPerClient := make(map[string]int64, len(result))
 	for _, r := range result {
 		totalPerClient[r.Client] = r.Total
 	}
 
+	logger.With("clients", len(totalPerClient)).Info("GetTotalPerClient done")
 	return totalPerClient, nil
 }
 
 func NewFilPlusIntegration() *FilPlusIntegration {
 	ctx := context.Background()
-	taskClient, err := mongo.
-		Connect(ctx, options.Client().ApplyURI(env.GetRequiredString(env.QueueMongoURI)))
-	if err != nil {
-		panic(err)
-	}
-	taskCollection := taskClient.
-		Database(env.GetRequiredString(env.QueueMongoDatabase)).Collection("claims_task_queue")
 
-	stateMarketDealsClient, err := mongo.
-		Connect(ctx, options.Client().ApplyURI(env.GetRequiredString(env.StatemarketdealsMongoURI)))
+	queueURI := env.GetRequiredString(env.QueueMongoURI)
+	queueDB := env.GetRequiredString(env.QueueMongoDatabase)
+	taskClient, err := mongo.Connect(ctx, options.Client().ApplyURI(queueURI))
 	if err != nil {
-		panic(err)
+		logger.With("err", err, "uri", queueURI).Fatal("mongo connect (queue) failed")
 	}
-	marketDealsCollection := stateMarketDealsClient.
-		Database(env.GetRequiredString(env.StatemarketdealsMongoDatabase)).
-		Collection("claims")
+	taskCollection := taskClient.Database(queueDB).Collection("claims_task_queue")
+	logger.With("uri", queueURI, "db", queueDB).Info("connected to queue mongo")
 
-	resultClient, err := mongo.Connect(ctx, options.Client().ApplyURI(env.GetRequiredString(env.ResultMongoURI)))
+	stateURI := env.GetRequiredString(env.StatemarketdealsMongoURI)
+	stateDB := env.GetRequiredString(env.StatemarketdealsMongoDatabase)
+	stateMarketDealsClient, err := mongo.Connect(ctx, options.Client().ApplyURI(stateURI))
 	if err != nil {
-		panic(err)
+		logger.With("err", err, "uri", stateURI).Fatal("mongo connect (market) failed")
 	}
-	resultCollection := resultClient.
-		Database(env.GetRequiredString(env.ResultMongoDatabase)).
-		Collection("claims_task_result")
+	marketDealsCollection := stateMarketDealsClient.Database(stateDB).Collection("claims")
+	logger.With("uri", stateURI, "db", stateDB).Info("connected to market mongo")
+
+	resultURI := env.GetRequiredString(env.ResultMongoURI)
+	resultDB := env.GetRequiredString(env.ResultMongoDatabase)
+	resultClient, err := mongo.Connect(ctx, options.Client().ApplyURI(resultURI))
+	if err != nil {
+		logger.With("err", err, "uri", resultURI).Fatal("mongo connect (result) failed")
+	}
+	resultCollection := resultClient.Database(resultDB).Collection("claims_task_result")
+	logger.With("uri", resultURI, "db", resultDB).Info("connected to result mongo")
 
 	batchSize := env.GetInt(env.FilplusIntegrationBatchSize, 100)
 	providerCacheTTL := env.GetDuration(env.ProviderCacheTTL, 24*time.Hour)
 	locationCacheTTL := env.GetDuration(env.LocationCacheTTL, 24*time.Hour)
 	locationResolver := resolver.NewLocationResolver(env.GetRequiredString(env.IPInfoToken), locationCacheTTL)
-	providerResolver, err := resolver.NewProviderResolver(
-		env.GetString(env.LotusAPIUrl, "https://api.node.glif.io/rpc/v0"),
-		env.GetString(env.LotusAPIToken, ""),
-		providerCacheTTL)
+
+	lotusURL := env.GetString(env.LotusAPIUrl, "https://api.node.glif.io/rpc/v0")
+	lotusToken := env.GetString(env.LotusAPIToken, "")
+	providerResolver, err := resolver.NewProviderResolver(lotusURL, lotusToken, providerCacheTTL)
 	if err != nil {
-		panic(err)
+		logger.With("err", err, "lotusURL", lotusURL).Fatal("NewProviderResolver failed")
 	}
 
-	// Check public IP address
 	ipInfo, err := resolver.GetPublicIPInfo(ctx, "", "")
 	if err != nil {
-		panic(err)
+		logger.With("err", err).Fatal("GetPublicIPInfo failed")
 	}
-
-	logger.With("ipinfo", ipInfo).Infof("Public IP info retrieved")
+	logger.With("ip", ipInfo.IP, "country", ipInfo.Country, "asn", ipInfo.ASN, "isp", ipInfo.ISP).Info("Public IP info retrieved")
 
 	return &FilPlusIntegration{
 		taskCollection:        taskCollection,
@@ -199,20 +262,14 @@ func NewFilPlusIntegration() *FilPlusIntegration {
 		ipInfo:                ipInfo,
 		randConst:             env.GetFloat64(env.FilplusIntegrationRandConst, 4.0),
 	}
-
 }
 
-// getDealsGroupedByClientProvider groups claims by client_addr and miner_addr, sorted by term_start desc
 // 先分组后根据 claim_id 倒序排序；每组仅保留前 30%
 func getDealsGroupedByClientProvider(collection *mongo.Collection) (map[string]map[string][]model.DBClaim, error) {
 	ctx := context.Background()
 
-	// 这里不强依赖 Mongo 端排序；直接把需要的字段全取回在内存里分组+排序
-	// 如果数据非常大，可以考虑增加时间窗/条件，或换用 Mongo 的 $setWindowFields 做组内排名（见下方可选实现思路）
+	stageStart := time.Now()
 	cur, err := collection.Aggregate(ctx, mongo.Pipeline{
-		// 如果需要可以加筛选条件再拉数据
-		// {{"$match", bson.D{{"term_start", bson.D{{"$gt", 0}}}}}},
-		// 也可以按需投影减少传输体积（示例仅保留用到的字段）
 		{{Key: "$project", Value: bson.D{
 			{Key: "client_addr", Value: 1},
 			{Key: "miner_addr", Value: 1},
@@ -223,47 +280,43 @@ func getDealsGroupedByClientProvider(collection *mongo.Collection) (map[string]m
 			{Key: "term_start", Value: 1},
 			{Key: "_id", Value: 0},
 		}}},
-	})
+	}, options.Aggregate().SetAllowDiskUse(true))
 	if err != nil {
-		logger.Errorf("Failed to aggregate data: %v", err)
+		logger.With("err", err).Error("aggregate failed")
 		return nil, err
 	}
 	defer cur.Close(ctx)
 
 	var deals []model.DBClaim
 	if err := cur.All(ctx, &deals); err != nil {
-		logger.Errorf("Failed to decode data: %v", err)
+		logger.With("err", err).Error("cursor decode failed")
 		return nil, err
 	}
+	logger.With("scanned", len(deals), "elapsed", time.Since(stageStart)).Info("claims scanned")
 
-	// 分组：client_addr -> miner_addr -> []DBClaim
+	groupStart := time.Now()
 	grouped := make(map[string]map[string][]model.DBClaim, 20000)
 	for _, d := range deals {
-		c := d.ClientAddr
-		m := d.MinerAddr
-		if c == "" || m == "" {
+		if d.ClientAddr == "" || d.MinerAddr == "" {
 			continue
 		}
-		if _, ok := grouped[c]; !ok {
-			grouped[c] = make(map[string][]model.DBClaim, 8)
+		if _, ok := grouped[d.ClientAddr]; !ok {
+			grouped[d.ClientAddr] = make(map[string][]model.DBClaim, 8)
 		}
-		grouped[c][m] = append(grouped[c][m], d)
+		grouped[d.ClientAddr][d.MinerAddr] = append(grouped[d.ClientAddr][d.MinerAddr], d)
 	}
+	logger.With("clients", len(grouped), "elapsed", time.Since(groupStart)).Info("grouped by client->miner")
 
-	// 组内排序（按 claim_id 倒序）并取前 30%
+	trimStart := time.Now()
+	var kept int
 	for c, miners := range grouped {
 		for m, arr := range miners {
 			if len(arr) == 0 {
 				continue
 			}
-			// 组内倒序：claim_id 大在前
-			sort.Slice(arr, func(i, j int) bool {
-				return arr[i].ClaimID > arr[j].ClaimID
-			})
-			// 前 30%
+			sort.Slice(arr, func(i, j int) bool { return arr[i].ClaimID > arr[j].ClaimID })
 			n := int(math.Ceil(float64(len(arr)) * 0.30))
 			if n <= 0 {
-				// 没必要保留空组，直接置空或跳过
 				grouped[c][m] = nil
 				continue
 			}
@@ -271,92 +324,74 @@ func getDealsGroupedByClientProvider(collection *mongo.Collection) (map[string]m
 				n = len(arr)
 			}
 			grouped[c][m] = arr[:n]
+			kept += n
 		}
 	}
+	logger.With("kept", kept, "elapsed", time.Since(trimStart)).Info("top30% per group trimmed")
 
 	return grouped, nil
 }
 
-// randomSampleFromGroup randomly samples up to sampleSize claims
-func randomSampleFromGroup(deals []model.DBClaim, sampleSize int) []model.DBClaim {
-	rand.Seed(time.Now().UnixNano())
-	rand.Shuffle(len(deals), func(i, j int) {
-		deals[i], deals[j] = deals[j], deals[i]
-	})
-
-	if len(deals) > sampleSize {
-		deals = deals[:sampleSize]
-	}
-	return deals
-}
-
 func (f *FilPlusIntegration) RunOnce(ctx context.Context, documentsOne []model.DBClaim) error {
-	logger.Info("start running filplus integration")
+	logger.With("docs", len(documentsOne)).Info("RunOnce begin")
 
+	waitStart := time.Now()
 	for {
-		// Check the number of tasks in the queue
 		count, err := f.taskCollection.CountDocuments(ctx, bson.M{"requester": f.requester})
 		if err != nil {
+			logger.With("err", err).Error("count tasks failed")
 			return errors.Wrap(err, "failed to count tasks")
 		}
 
-		logger.With("count", count).Info("Current number of tasks in the queue")
-
-		// If task count exceeds batch size, block and wait
 		if count > int64(f.batchSize) {
-			logger.Infof("Task queue still has %d tasks, waiting...", count)
+			logger.With("current", count, "batchSize", f.batchSize).Warn("queue still busy, wait 10s...")
 			time.Sleep(10 * time.Second)
 			continue
 		}
 		break
 	}
+	logger.With("waited", time.Since(waitStart)).Info("queue capacity ok")
 
-	// 构造任务（util.AddTasks 版本已适配 DBClaim，并使用 DataCID）
 	tasks, results := util.AddTasks(ctx, f.requester, f.ipInfo, documentsOne, f.locationResolver, f.providerResolver)
+	logger.With("tasks", len(tasks), "results", len(results)).Info("AddTasks generated")
 
 	if len(tasks) > 0 {
-		_, err := f.taskCollection.InsertMany(ctx, tasks)
-		if err != nil {
+		if _, err := f.taskCollection.InsertMany(ctx, tasks); err != nil {
+			logger.With("err", err, "tasks", len(tasks)).Error("insert tasks failed")
 			return errors.Wrap(err, "failed to insert tasks")
 		}
+		logger.With("inserted", len(tasks)).Info("tasks inserted")
+	} else {
+		logger.Info("no tasks generated")
 	}
-
-	logger.With("count", len(tasks)).Info("inserted tasks")
 
 	countPerCountry := make(map[string]int)
 	countPerContinent := make(map[string]int)
 	countPerModule := make(map[task.ModuleName]int)
 	for _, t := range tasks {
-		//nolint:forcetypeassert
 		tsk := t.(task.Task)
-		country := tsk.Provider.Country
-		continent := tsk.Provider.Continent
-		module := tsk.Module
-		countPerCountry[country]++
-		countPerContinent[continent]++
-		countPerModule[module]++
+		countPerCountry[tsk.Provider.Country]++
+		countPerContinent[tsk.Provider.Continent]++
+		countPerModule[tsk.Module]++
 	}
-
-	for country, count := range countPerCountry {
-		logger.With("country", country, "count", count).Info("tasks per country")
+	for k, v := range countPerCountry {
+		logger.With("country", k, "count", v).Info("tasks per country")
 	}
-
-	for continent, count := range countPerContinent {
-		logger.With("continent", continent, "count", count).Info("tasks per continent")
+	for k, v := range countPerContinent {
+		logger.With("continent", k, "count", v).Info("tasks per continent")
 	}
-
-	for module, count := range countPerModule {
-		logger.With("module", module, "count", count).Info("tasks per module")
+	for k, v := range countPerModule {
+		logger.With("module", k, "count", v).Info("tasks per module")
 	}
 
 	if len(results) > 0 {
-		_, err := f.resultCollection.InsertMany(ctx, results)
-		if err != nil {
+		if _, err := f.resultCollection.InsertMany(ctx, results); err != nil {
+			logger.With("err", err, "results", len(results)).Error("insert results failed")
 			return errors.Wrap(err, "failed to insert results")
 		}
+		logger.With("inserted", len(results)).Info("results inserted")
 	}
 
-	logger.With("count", len(results)).Info("inserted results")
-
+	logger.With("docs", len(documentsOne)).Info("RunOnce done")
 	return nil
 }

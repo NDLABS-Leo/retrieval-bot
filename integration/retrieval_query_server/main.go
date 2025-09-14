@@ -61,23 +61,19 @@ type ClientMinerItem struct {
 	SuccessRateBitswap   float64 `json:"success_rate_bitswap"`
 }
 
-type aggOut3Keys struct {
+type aggOut2Keys struct {
 	ID struct {
 		Client string `bson:"client"`
 		Miner  string `bson:"miner"`
-		Module string `bson:"module"`
 	} `bson:"_id"`
 	Total int64 `bson:"total"`
 	OK    int64 `bson:"ok"`
 }
 
-type aggOut2Keys struct {
-	ID struct {
-		Miner  string `bson:"miner"`
-		Module string `bson:"module"`
-	} `bson:"_id"`
-	Total int64 `bson:"total"`
-	OK    int64 `bson:"ok"`
+type aggOut1Key struct {
+	ID    string `bson:"_id"`
+	Total int64  `bson:"total"`
+	OK    int64  `bson:"ok"`
 }
 
 func mustInit() {
@@ -125,14 +121,14 @@ func runOnce() {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
 
-	// 1) client_addr + miner_addr（分别统计 http/graphsync/bitswap）
+	// 1) client_addr + miner_addr 统计（列表存到 key: stats:client:<client_addr>）
 	if err := computeAndStoreClientMiner(ctx); err != nil {
 		log.Printf("[cron] client+miner agg error: %v", err)
 	} else {
 		log.Println("[cron] client+miner agg ok")
 	}
 
-	// 2) miner_addr（分别统计 http/graphsync/bitswap；ZSET 仍用 http 排序）
+	// 2) miner_addr 统计（对象存到 key: stats:miner:<miner>，并更新 ZSET）
 	if err := computeAndStoreMiner(ctx); err != nil {
 		log.Printf("[cron] miner agg error: %v", err)
 	} else {
@@ -142,20 +138,19 @@ func runOnce() {
 
 // ============= 聚合 =============
 
-// client_addr + miner_addr + module
+// client_addr + miner_addr
 func computeAndStoreClientMiner(ctx context.Context) error {
-	// 成功率 = 每个 module 下 success(true)/total；分别统计 http/graphsync/bitswap
+	// 只统计 module=http；成功率 = success(true)/total
 	pipeline := mongo.Pipeline{
 		{{Key: "$match", Value: bson.M{
-			// 可按需加时间窗，例如：
+			"task.module": "http",
+			// 时间窗（可按需开启）
 			// "created_at": bson.M{"$gte": time.Now().Add(-24 * time.Hour)},
-			"task.module": bson.M{"$in": bson.A{"http", "graphsync", "bitswap"}},
 		}}},
 		{{Key: "$group", Value: bson.M{
 			"_id": bson.M{
 				"client": "$task.metadata.client",
 				"miner":  "$task.provider.id",
-				"module": "$task.module",
 			},
 			"total": bson.M{"$sum": 1},
 			"ok":    bson.M{"$sum": bson.M{"$cond": []any{"$result.success", 1, 0}}},
@@ -168,55 +163,33 @@ func computeAndStoreClientMiner(ctx context.Context) error {
 	}
 	defer cur.Close(ctx)
 
-	// 临时累加器：client -> miner -> module -> (ok,total)
-	type pair struct{ ok, total int64 }
-	acc := make(map[string]map[string]map[string]pair, 4096)
-
+	// 聚合为：client -> []items
+	group := make(map[string][]ClientMinerItem, 4096)
 	for cur.Next(ctx) {
-		var a aggOut3Keys
+		var a aggOut2Keys
 		if err := cur.Decode(&a); err != nil {
 			return err
 		}
-		if a.ID.Client == "" || a.ID.Miner == "" || a.ID.Module == "" || a.Total == 0 {
+		if a.ID.Client == "" || a.ID.Miner == "" || a.Total == 0 {
 			continue
 		}
-		if _, ok := acc[a.ID.Client]; !ok {
-			acc[a.ID.Client] = make(map[string]map[string]pair)
+		r := float64(a.OK) / float64(a.Total)
+		it := ClientMinerItem{
+			ClientAddr:           a.ID.Client,
+			MinerAddr:            a.ID.Miner,
+			SuccessRateHTTP:      r,
+			SuccessRateGraphsync: 0,
+			SuccessRateBitswap:   0,
 		}
-		if _, ok := acc[a.ID.Client][a.ID.Miner]; !ok {
-			acc[a.ID.Client][a.ID.Miner] = make(map[string]pair, 3)
-		}
-		acc[a.ID.Client][a.ID.Miner][a.ID.Module] = pair{ok: a.OK, total: a.Total}
+		group[a.ID.Client] = append(group[a.ID.Client], it)
 	}
 	if err := cur.Err(); err != nil {
 		return err
 	}
 
-	// 汇总为列表，并写入 Redis：stats:client:<client_addr>（值是 JSON 数组）
+	// 写回 Redis：一个 client 一个 key（值是 JSON 数组）
 	pipe := rds.Pipeline()
-	for client, miners := range acc {
-		list := make([]ClientMinerItem, 0, len(miners))
-		for miner, byModule := range miners {
-			var httpRate, gsRate, bsRate float64
-
-			if v, ok := byModule["http"]; ok && v.total > 0 {
-				httpRate = float64(v.ok) / float64(v.total)
-			}
-			if v, ok := byModule["graphsync"]; ok && v.total > 0 {
-				gsRate = float64(v.ok) / float64(v.total)
-			}
-			if v, ok := byModule["bitswap"]; ok && v.total > 0 {
-				bsRate = float64(v.ok) / float64(v.total)
-			}
-
-			list = append(list, ClientMinerItem{
-				ClientAddr:           client,
-				MinerAddr:            miner,
-				SuccessRateHTTP:      httpRate,
-				SuccessRateGraphsync: gsRate,
-				SuccessRateBitswap:   bsRate,
-			})
-		}
+	for client, list := range group {
 		// 为方便列表页展示，先按 http 降序存储
 		sort.Slice(list, func(i, j int) bool { return list[i].SuccessRateHTTP > list[j].SuccessRateHTTP })
 		bz, _ := json.Marshal(list)
@@ -226,18 +199,15 @@ func computeAndStoreClientMiner(ctx context.Context) error {
 	return err
 }
 
-// miner_addr + module
+// miner_addr
 func computeAndStoreMiner(ctx context.Context) error {
 	pipeline := mongo.Pipeline{
 		{{Key: "$match", Value: bson.M{
+			"task.module": "http",
 			// "created_at": bson.M{"$gte": time.Now().Add(-24 * time.Hour)},
-			"task.module": bson.M{"$in": bson.A{"http", "graphsync", "bitswap"}},
 		}}},
 		{{Key: "$group", Value: bson.M{
-			"_id": bson.M{
-				"miner":  "$task.provider.id",
-				"module": "$task.module",
-			},
+			"_id":   "$task.provider.id",
 			"total": bson.M{"$sum": 1},
 			"ok":    bson.M{"$sum": bson.M{"$cond": []any{"$result.success", 1, 0}}},
 		}}},
@@ -249,48 +219,25 @@ func computeAndStoreMiner(ctx context.Context) error {
 	}
 	defer cur.Close(ctx)
 
-	// 累加：miner -> module -> (ok,total)
-	type pair struct{ ok, total int64 }
-	acc := make(map[string]map[string]pair, 4096)
-
+	pipe := rds.Pipeline()
+	pipe.Del(ctx, zsetMinerHTTP) // 重建一次索引；也可做差异更新
 	for cur.Next(ctx) {
-		var a aggOut2Keys
+		var a aggOut1Key
 		if err := cur.Decode(&a); err != nil {
 			return err
 		}
-		if a.ID.Miner == "" || a.ID.Module == "" || a.Total == 0 {
+		if a.ID == "" || a.Total == 0 {
 			continue
 		}
-		if _, ok := acc[a.ID.Miner]; !ok {
-			acc[a.ID.Miner] = make(map[string]pair, 3)
-		}
-		acc[a.ID.Miner][a.ID.Module] = pair{ok: a.OK, total: a.Total}
+		r := float64(a.OK) / float64(a.Total)
+		doc := RateDoc{SuccessRateHTTP: r, SuccessRateGraphsync: 0, SuccessRateBitswap: 0}
+		bz, _ := json.Marshal(doc)
+		pipe.Set(ctx, keyMinerPrefix+a.ID, string(bz), redisTTL)
+		pipe.ZAdd(ctx, zsetMinerHTTP, redis.Z{Member: a.ID, Score: r})
 	}
 	if err := cur.Err(); err != nil {
 		return err
 	}
-
-	pipe := rds.Pipeline()
-	pipe.Del(ctx, zsetMinerHTTP) // 重建 http 排序索引
-
-	for miner, byModule := range acc {
-		var httpRate, gsRate, bsRate float64
-		if v, ok := byModule["http"]; ok && v.total > 0 {
-			httpRate = float64(v.ok) / float64(v.total)
-		}
-		if v, ok := byModule["graphsync"]; ok && v.total > 0 {
-			gsRate = float64(v.ok) / float64(v.total)
-		}
-		if v, ok := byModule["bitswap"]; ok && v.total > 0 {
-			bsRate = float64(v.ok) / float64(v.total)
-		}
-
-		doc := RateDoc{SuccessRateHTTP: httpRate, SuccessRateGraphsync: gsRate, SuccessRateBitswap: bsRate}
-		bz, _ := json.Marshal(doc)
-		pipe.Set(ctx, keyMinerPrefix+miner, string(bz), redisTTL)
-		pipe.ZAdd(ctx, zsetMinerHTTP, redis.Z{Member: miner, Score: httpRate})
-	}
-
 	_, err = pipe.Exec(ctx)
 	return err
 }
@@ -369,7 +316,7 @@ func handleMiners(w http.ResponseWriter, r *http.Request) {
 // /clients?client_addr=&page=&page_size=
 // - 必须传 client_addr
 // - 从 Redis key stats:client:<client_addr> 读取 JSON 数组
-// - 按 http 降序后分页返回（写入时已排序，这里再保护性排序）
+// - 按 http 降序后分页返回（已在写入时排序，这里仍保护性再排一次）
 func handleClients(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	q := r.URL.Query()
@@ -394,6 +341,7 @@ func handleClients(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "decode error: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
+	// 降序再保证一次
 	sort.Slice(list, func(i, j int) bool { return list[i].SuccessRateHTTP > list[j].SuccessRateHTTP })
 
 	page, pageSize := parsePage(q.Get("page"), q.Get("page_size"))
@@ -432,20 +380,16 @@ func handleClients(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// /details?miner_addr=...|client_addr=...&status=0|1&retrieval_method=http|graphsync|bitswap&page=&page_size=
+// /details?miner_addr=...|client_addr=...&status=0|1&retrieval_method=http&page=&page_size=
 func handleDetails(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	q := r.URL.Query()
-
-	// 支持 http / graphsync / bitswap（默认 http）
 	method := q.Get("retrieval_method")
 	if method == "" {
 		method = "http"
 	}
-	switch method {
-	case "http", "graphsync", "bitswap":
-	default:
-		http.Error(w, "retrieval_method must be one of: http | graphsync | bitswap", http.StatusBadRequest)
+	if method != "http" {
+		http.Error(w, "only http supported", http.StatusBadRequest)
 		return
 	}
 
@@ -591,8 +535,8 @@ func main() {
 	mustInit()
 	startCron()
 
-	http.HandleFunc("/miners", handleMiners)   // 列表/检索 miner（按 http 成功率降序）
-	http.HandleFunc("/clients", handleClients) // 某 client 下的 miners（按 http 降序）
+	http.HandleFunc("/miners", handleMiners)   // 列表/检索 miner
+	http.HandleFunc("/clients", handleClients) // 列表/检索 client 下 miners
 	http.HandleFunc("/details", handleDetails) // 明细（仅 http）
 
 	log.Printf("listening on %s", cfg.BindAddr)
