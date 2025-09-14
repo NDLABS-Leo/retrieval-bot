@@ -5,10 +5,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/ipfs/go-cid"
 	"math/rand"
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"time"
 
 	"github.com/filecoin-project/go-address"
@@ -18,8 +20,6 @@ import (
 	lotusclient "github.com/filecoin-project/lotus/api/client"
 	"github.com/filecoin-project/lotus/api/v1api"
 	"github.com/filecoin-project/lotus/chain/types"
-
-	"github.com/ipfs/go-cid"
 	logging "github.com/ipfs/go-log/v2"
 
 	"go.mongodb.org/mongo-driver/bson"
@@ -37,12 +37,6 @@ type cfg struct {
 	MongoURI  string
 	MongoDB   string
 	MongoColl string
-
-	// 增量配置
-	PollEvery       time.Duration // 轮询间隔（建议 <30s）
-	SafeDelay       int64         // 与链头保持的安全延迟（Epoch）
-	BackfillStart   int64         // 无 last_height 时回补窗口（Epoch 数）
-	MaxHeightsBatch int64         // 单轮最多处理的高度数量
 }
 
 func mustEnv(key, def string) string {
@@ -56,69 +50,31 @@ func mustEnv(key, def string) string {
 	return v
 }
 
-func parseInt64(s string) (int64, error) {
-	var v int64
-	_, err := fmt.Sscan(s, &v)
-	return v, err
-}
-
 func loadCfg() cfg {
-	poll := 15 * time.Second
-	if s := os.Getenv("POLL_EVERY"); s != "" {
-		if d, err := time.ParseDuration(s); err == nil {
-			poll = d
-		}
-	}
-	safeDelay := int64(1)
-	if s := os.Getenv("SAFE_DELAY"); s != "" {
-		if v, err := parseInt64(s); err == nil {
-			safeDelay = v
-		}
-	}
-	backfill := int64(120)
-	if s := os.Getenv("BACKFILL_START"); s != "" {
-		if v, err := parseInt64(s); err == nil {
-			backfill = v
-		}
-	}
-	maxBatch := int64(180)
-	if s := os.Getenv("MAX_HEIGHTS_BATCH"); s != "" {
-		if v, err := parseInt64(s); err == nil {
-			maxBatch = v
-		}
-	}
-
 	return cfg{
-		LotusURL:        mustEnv("FULLNODE_API_URL", ""),
-		LotusJWT:        os.Getenv("FULLNODE_API_TOKEN"),
-		MongoURI:        mustEnv("MONGO_URI", ""),
-		MongoDB:         mustEnv("MONGO_DB", "filstats"),
-		MongoColl:       mustEnv("MONGO_CLAIMS_COLL", "claims"),
-		PollEvery:       poll,
-		SafeDelay:       safeDelay,
-		BackfillStart:   backfill,
-		MaxHeightsBatch: maxBatch,
+		LotusURL:  mustEnv("FULLNODE_API_URL", ""),
+		LotusJWT:  os.Getenv("FULLNODE_API_TOKEN"),
+		MongoURI:  mustEnv("MONGO_URI", ""),
+		MongoDB:   mustEnv("MONGO_DB", "filstats"),
+		MongoColl: mustEnv("MONGO_CLAIMS_COLL", "claims"),
 	}
 }
 
-/********** Mongo 文档结构 **********/
+/********** Mongo 文档结构（入库结构）**********/
 type DBClaim struct {
-	// 唯一键三元组（建立联合唯一索引）
-	ProviderID int64  `bson:"provider_id"`
-	ClientID   int64  `bson:"client_id"`
-	DataCID    string `bson:"data_cid"`
-
-	Size      int64     `bson:"size"`
-	TermMin   int64     `bson:"term_min"`
-	TermMax   int64     `bson:"term_max"`
-	TermStart int64     `bson:"term_start"`
-	Sector    uint64    `bson:"sector"`
-	UpdatedAt time.Time `bson:"updated_at"`
-
-	// 仅在全量时可补充（增量不一定有）
-	ClientAddr string `bson:"client_addr,omitempty"`
-	MinerAddr  string `bson:"miner_addr,omitempty"`
-	ClaimID    int64  `bson:"claim_id,omitempty"` // 全量时可带入（不参与唯一约束）
+	ClaimID    int64          `bson:"claim_id"`              // 可为空（增量时未直接给出），全量时可填入链上 claimId
+	ProviderID int64          `bson:"provider_id"`           // abi.ActorID
+	ClientID   int64          `bson:"client_id,omitempty"`   // 可选
+	ClientAddr string         `bson:"client_addr,omitempty"` // 可选（解析账户钥匙地址可另行补全）
+	DataCID    string         `bson:"data_cid"`              // cid string
+	Size       int64          `bson:"size"`
+	TermMin    int64          `bson:"term_min"`
+	TermMax    int64          `bson:"term_max"`
+	TermStart  int64          `bson:"term_start"`
+	Sector     uint64         `bson:"sector"`
+	MinerAddr  string         `bson:"miner_addr,omitempty"` // 例如 f0<providerID>；或基于 ID 地址
+	UpdatedAt  time.Time      `bson:"updated_at"`
+	Meta       map[string]any `bson:"meta,omitempty"`
 }
 
 /********** Lotus 连接 **********/
@@ -134,7 +90,7 @@ func connectLotus(ctx context.Context, url, jwt string) (v1api.FullNode, func(),
 	return full, func() { closer() }, nil
 }
 
-/********** Mongo 连接 + 索引 **********/
+/********** Mongo 连接与索引 **********/
 func connectMongo(ctx context.Context, uri, db, coll string) (*mongo.Client, *mongo.Collection, error) {
 	mc, err := mongo.Connect(ctx, options.Client().ApplyURI(uri))
 	if err != nil {
@@ -142,24 +98,122 @@ func connectMongo(ctx context.Context, uri, db, coll string) (*mongo.Client, *mo
 	}
 	c := mc.Database(db).Collection(coll)
 
-	// 唯一索引：provider_id + client_id + data_cid（幂等去重）
+	// 业务唯一键：避免重复（增量）
+	// 唯一索引：(provider_id, data_cid, sector, term_start)
 	_, _ = c.Indexes().CreateOne(ctx, mongo.IndexModel{
-		Keys: bson.D{
-			{Key: "provider_id", Value: 1},
-			{Key: "client_id", Value: 1},
-			{Key: "data_cid", Value: 1},
-		},
-		Options: options.Index().SetUnique(true).SetName("uniq_provider_client_data"),
+		Keys:    bson.D{{Key: "provider_id", Value: 1}, {Key: "data_cid", Value: 1}, {Key: "sector", Value: 1}, {Key: "term_start", Value: 1}},
+		Options: options.Index().SetUnique(true).SetName("uniq_claim_tuple"),
 	})
-	// 辅助查询
+	// 兼容旧逻辑（若你仍需要通过全量 claim_id 做去重，可保留此唯一索引）
+	_, _ = c.Indexes().CreateOne(ctx, mongo.IndexModel{
+		Keys:    bson.D{{Key: "provider_id", Value: 1}, {Key: "claim_id", Value: 1}},
+		Options: options.Index().SetUnique(true).SetSparse(true).SetName("uniq_provider_claimid"),
+	})
+	// 辅助检索
 	_, _ = c.Indexes().CreateMany(ctx, []mongo.IndexModel{
+		{Keys: bson.D{{Key: "client_addr", Value: 1}}},
+		{Keys: bson.D{{Key: "miner_addr", Value: 1}}},
 		{Keys: bson.D{{Key: "updated_at", Value: -1}}},
 	})
 
 	return mc, c, nil
 }
 
-/********** meta：存 last_height 与 full_import_done **********/
+/********** 工具：是否有算力 **********/
+func hasNonZeroPower(p *lotusapi.MinerPower) bool {
+	if p == nil {
+		return false
+	}
+	return p.MinerPower.RawBytePower.GreaterThan(types.NewInt(0)) ||
+		p.MinerPower.QualityAdjPower.GreaterThan(types.NewInt(0))
+}
+
+/********** 全量：逐矿工 StateGetClaims 并 upsert **********/
+func crawlOnce(ctx context.Context, api v1api.FullNode, coll *mongo.Collection) error {
+	head := types.EmptyTSK
+
+	miners, err := api.StateListMiners(ctx, head)
+	if err != nil {
+		return fmt.Errorf("StateListMiners: %w", err)
+	}
+	log.Infof("miners listed: %d", len(miners))
+
+	var active []address.Address
+	for _, m := range miners {
+		mp, err := api.StateMinerPower(ctx, m, head)
+		if err != nil {
+			log.Warnw("StateMinerPower error", "miner", m.String(), "err", err)
+			continue
+		}
+		if hasNonZeroPower(mp) {
+			active = append(active, m)
+		}
+	}
+	log.Infof("active miners (non-zero power): %d", len(active))
+
+	upserts := 0
+	for _, m := range active {
+		idAddr, err := api.StateLookupID(ctx, m, head)
+		if err != nil {
+			log.Warnw("StateLookupID", "miner", m.String(), "err", err)
+			continue
+		}
+		id, err := address.IDFromAddress(idAddr)
+		if err != nil {
+			log.Warnw("IDFromAddress", "idAddr", idAddr.String(), "err", err)
+			continue
+		}
+		providerID := abi.ActorID(id)
+
+		mclaims, err := api.StateGetClaims(ctx, idAddr, head)
+		if err != nil {
+			log.Warnw("StateGetClaims", "provider", idAddr.String(), "err", err)
+			continue
+		}
+		if len(mclaims) == 0 {
+			continue
+		}
+
+		for claimID, c := range mclaims {
+			doc := DBClaim{
+				ClaimID:    int64(claimID),
+				ProviderID: int64(providerID),
+				ClientID:   int64(c.Client),
+				ClientAddr: "", // 可选：如需可再补 StateAccountKey
+				DataCID:    c.Data.String(),
+				Size:       int64(c.Size),
+				TermMin:    int64(c.TermMin),
+				TermMax:    int64(c.TermMax),
+				TermStart:  int64(c.TermStart),
+				Sector:     uint64(c.Sector),
+				MinerAddr:  idAddr.String(),
+				UpdatedAt:  time.Now(),
+			}
+			// 兼容：优先业务唯一键防重；若 claim_id 唯一键存在也会命中
+			filter := bson.M{
+				"provider_id": doc.ProviderID,
+				"data_cid":    doc.DataCID,
+				"sector":      doc.Sector,
+				"term_start":  doc.TermStart,
+			}
+			update := bson.M{"$setOnInsert": doc, "$set": bson.M{"updated_at": time.Now()}}
+			res, err := coll.UpdateOne(ctx, filter, update, options.Update().SetUpsert(true))
+			if err != nil {
+				if !mongo.IsDuplicateKeyError(err) {
+					log.Warnw("upsert claim failed", "provider_id", doc.ProviderID, "claim_id", doc.ClaimID, "err", err)
+				}
+				continue
+			}
+			if res.UpsertedCount > 0 {
+				upserts++
+			}
+		}
+	}
+	log.Infow("full crawl finished", "upserts", upserts)
+	return nil
+}
+
+/********** 元数据：last_height & full_import_done **********/
 const metaCollName = "claims_meta"
 const metaKeyLastHeight = "last_height"
 const metaKeyFullDone = "full_import_done"
@@ -178,6 +232,7 @@ func getLastHeight(ctx context.Context, db *mongo.Database) (int64, error) {
 	}
 	return md.Height, err
 }
+
 func setLastHeight(ctx context.Context, db *mongo.Database, h int64) error {
 	_, err := db.Collection(metaCollName).UpdateOne(
 		ctx,
@@ -187,6 +242,7 @@ func setLastHeight(ctx context.Context, db *mongo.Database, h int64) error {
 	)
 	return err
 }
+
 func getFullImportDone(ctx context.Context, db *mongo.Database) (bool, error) {
 	var md metaDoc
 	err := db.Collection(metaCollName).FindOne(ctx, bson.M{"_id": metaKeyFullDone}).Decode(&md)
@@ -195,6 +251,7 @@ func getFullImportDone(ctx context.Context, db *mongo.Database) (bool, error) {
 	}
 	return md.Done, err
 }
+
 func setFullImportDone(ctx context.Context, db *mongo.Database, done bool) error {
 	_, err := db.Collection(metaCollName).UpdateOne(
 		ctx,
@@ -205,177 +262,158 @@ func setFullImportDone(ctx context.Context, db *mongo.Database, done bool) error
 	return err
 }
 
-/********** 全量：StateGetClaims 扫描并入库 **********/
-func hasNonZeroPower(p *lotusapi.MinerPower) bool {
-	if p == nil {
-		return false
-	}
-	return p.MinerPower.RawBytePower.GreaterThan(types.NewInt(0)) ||
-		p.MinerPower.QualityAdjPower.GreaterThan(types.NewInt(0))
-}
+/********** 增量：通过 StateReplay 扫 ExecutionTrace 的内部调用 **********/
 
-func fullImport(ctx context.Context, api v1api.FullNode, coll *mongo.Collection) error {
-	head := types.EmptyTSK
-
-	// 1) 所有矿工
-	miners, err := api.StateListMiners(ctx, head)
-	if err != nil {
-		return fmt.Errorf("StateListMiners: %w", err)
-	}
-	log.Infof("full-import: miners listed=%d", len(miners))
-
-	// 2) 过滤有算力
-	var active []address.Address
-	for _, m := range miners {
-		mp, err := api.StateMinerPower(ctx, m, head)
-		if err != nil {
-			log.Warnw("StateMinerPower", "miner", m.String(), "err", err)
-			continue
-		}
-		if hasNonZeroPower(mp) {
-			active = append(active, m)
-		}
-	}
-	log.Infof("full-import: active miners (non-zero power)=%d", len(active))
-
-	// 3) 逐个 Provider 拉 claims 并 upsert
-	var upserts int64
-	for _, m := range active {
-		// 归一到 ID 地址与 ActorID
-		idAddr, err := api.StateLookupID(ctx, m, head)
-		if err != nil {
-			log.Warnw("StateLookupID", "miner", m.String(), "err", err)
-			continue
-		}
-		aid, err := address.IDFromAddress(idAddr)
-		if err != nil {
-			log.Warnw("IDFromAddress", "minerID", idAddr.String(), "err", err)
-			continue
-		}
-		providerID := int64(abi.ActorID(aid))
-
-		mclaims, err := api.StateGetClaims(ctx, idAddr, head)
-		if err != nil || len(mclaims) == 0 {
-			continue
-		}
-
-		for claimID, c := range mclaims {
-			// 可读 client 地址（兜底用 ID 地址）
-			idClientAddr, _ := address.NewIDAddress(uint64(c.Client))
-			keyAddr, err := api.StateAccountKey(ctx, idClientAddr, head)
-			clientAddrStr := idClientAddr.String()
-			if err == nil {
-				clientAddrStr = keyAddr.String()
-			}
-
-			doc := DBClaim{
-				ProviderID: providerID,
-				ClientID:   int64(c.Client),
-				DataCID:    c.Data.String(),
-				Size:       int64(c.Size),
-				TermMin:    int64(c.TermMin),
-				TermMax:    int64(c.TermMax),
-				TermStart:  int64(c.TermStart),
-				Sector:     uint64(c.Sector),
-				UpdatedAt:  time.Now(),
-				ClientAddr: clientAddrStr,
-				MinerAddr:  idAddr.String(),
-				ClaimID:    int64(claimID),
-			}
-			n, err := upsertClaims(ctx, coll, []DBClaim{doc})
-			if err != nil {
-				log.Warnw("full-import upsert", "provider", providerID, "client", doc.ClientID, "data", doc.DataCID, "err", err)
-				continue
-			}
-			upserts += n
-		}
-	}
-
-	log.Infow("full-import done", "inserted_new", upserts)
-	return nil
-}
-
+// VerifiedRegistry.ClaimAllocations 的方法号（在 v9+ 一直是 9）
 const claimAllocationsMethodNum = abi.MethodNum(9)
 
-/********** 判断是否 ClaimAllocations 调用（兼容 v9~v12） **********/
-// isClaimAllocationsCall 判断消息是否为 VerifiedRegistry.ClaimAllocations 调用
-func isClaimAllocationsCall(to address.Address, method abi.MethodNum) bool {
-	if to != builtin.VerifiedRegistryActorAddr {
-		return false
+// 从 StateDecodeParams 的 JSON 中尽量判断方法名
+func methodNameFromDecodeJSON(decStr string) string {
+	s := strings.ToLower(decStr)
+	if strings.Contains(s, "claimallocations") { // 常见
+		return "ClaimAllocations"
 	}
-	// VerifiedRegistry.ClaimAllocations 方法号固定为 9
-	return method == claimAllocationsMethodNum
+	if strings.Contains(s, "claim") && strings.Contains(s, "alloc") {
+		return "ClaimAllocations"
+	}
+	return ""
 }
 
-/********** 解析 ClaimAllocations 参数（JSON 解码） **********/
-type claimLite struct {
+func decodeParamsToString(v interface{}) string {
+	switch val := v.(type) {
+	case string:
+		return val
+	case []byte:
+		return string(val)
+	default:
+		// 兜底转 JSON 字符串
+		bz, err := json.Marshal(val)
+		if err != nil {
+			return fmt.Sprintf("%v", val)
+		}
+		return string(bz)
+	}
+}
+
+// 判断是否是 ClaimAllocations：先试图从 decode 名称判断，失败则回退方法号=9
+func isClaimAllocations(ctx context.Context, api v1api.FullNode,
+	to address.Address, method abi.MethodNum, params []byte, tsk types.TipSetKey) (bool, string) {
+
+	if to != builtin.VerifiedRegistryActorAddr {
+		return false, ""
+	}
+	decStr, err := api.StateDecodeParams(ctx, to, method, params, tsk)
+	if err == nil && decStr != "" {
+		desStr := decodeParamsToString(decStr)
+
+		if methodNameFromDecodeJSON(desStr) == "ClaimAllocations" {
+			return true, "name"
+		}
+	}
+	if method == claimAllocationsMethodNum {
+		return true, "mnum"
+	}
+	return false, ""
+}
+
+// 宽松地从 decode JSON 里提取 claims 数组（不同版本 JSON 结构不一致）
+type claimJSON struct {
 	Provider  uint64 `json:"Provider"`
 	Client    uint64 `json:"Client"`
 	Data      string `json:"Data"`
-	Size      uint64 `json:"Size"`
+	Size      int64  `json:"Size"`
 	TermMin   int64  `json:"TermMin"`
 	TermMax   int64  `json:"TermMax"`
 	TermStart int64  `json:"TermStart"`
 	Sector    uint64 `json:"Sector"`
 }
-type claimParamsJSON struct {
-	Claims []claimLite `json:"Claims"`
-}
 
-func parseClaimAllocationsParams(decJSON string) ([]DBClaim, error) {
-	var p claimParamsJSON
-	if err := json.Unmarshal([]byte(decJSON), &p); err != nil {
-		return nil, fmt.Errorf("unmarshal ClaimAllocations params: %w", err)
+func parseClaimAllocationsParamsFromDecode(
+	ctx context.Context,
+	api v1api.FullNode,
+	to address.Address,
+	method abi.MethodNum,
+	params []byte,
+	tsk types.TipSetKey,
+) ([]DBClaim, error) {
+	decStr, err := api.StateDecodeParams(ctx, to, method, params, tsk)
+	if err != nil {
+		return nil, fmt.Errorf("StateDecodeParams: %w", err)
 	}
-	out := make([]DBClaim, 0, len(p.Claims))
-	for _, c := range p.Claims {
-		if _, err := cid.Parse(c.Data); err != nil {
-			continue
+	var raw map[string]any
+	desStr := decodeParamsToString(decStr)
+	if err := json.Unmarshal([]byte(desStr), &raw); err != nil {
+		return nil, fmt.Errorf("decode json: %w", err)
+	}
+
+	// 寻找 claims 数组字段：claims / Claims / params.claims / params.Claims
+	var arr any
+	keys := []string{"claims", "Claims"}
+	for _, k := range keys {
+		if v, ok := raw[k]; ok {
+			arr = v
+			break
 		}
+	}
+	if arr == nil {
+		if p, ok := raw["params"].(map[string]any); ok {
+			for _, k := range keys {
+				if v, ok2 := p[k]; ok2 {
+					arr = v
+					break
+				}
+			}
+		}
+	}
+	if arr == nil {
+		// 没有 claims 字段，视为没有可解析的 Claim
+		return nil, nil
+	}
+
+	bz, _ := json.Marshal(arr)
+	var list []claimJSON
+	if err := json.Unmarshal(bz, &list); err != nil {
+		return nil, fmt.Errorf("claims array json: %w\nraw=%s", err, decStr)
+	}
+
+	out := make([]DBClaim, 0, len(list))
+	now := time.Now()
+	for _, c := range list {
 		out = append(out, DBClaim{
 			ProviderID: int64(c.Provider),
 			ClientID:   int64(c.Client),
 			DataCID:    c.Data,
-			Size:       int64(c.Size),
+			Size:       c.Size,
 			TermMin:    c.TermMin,
 			TermMax:    c.TermMax,
 			TermStart:  c.TermStart,
 			Sector:     c.Sector,
-			UpdatedAt:  time.Now(),
+			MinerAddr:  fmt.Sprintf("f0%d", c.Provider),
+			UpdatedAt:  now,
 		})
 	}
 	return out, nil
 }
 
-/********** upsert（幂等） **********/
+// 使用业务唯一键做 upsert 去重
 func upsertClaims(ctx context.Context, coll *mongo.Collection, claims []DBClaim) (int64, error) {
+	if len(claims) == 0 {
+		return 0, nil
+	}
 	var inserted int64
 	for _, c := range claims {
 		filter := bson.M{
 			"provider_id": c.ProviderID,
-			"client_id":   c.ClientID,
 			"data_cid":    c.DataCID,
+			"sector":      c.Sector,
+			"term_start":  c.TermStart,
 		}
-		update := bson.M{
-			"$setOnInsert": bson.M{
-				"provider_id": c.ProviderID,
-				"client_id":   c.ClientID,
-				"data_cid":    c.DataCID,
-				"size":        c.Size,
-				"term_min":    c.TermMin,
-				"term_max":    c.TermMax,
-				"term_start":  c.TermStart,
-				"sector":      c.Sector,
-				"client_addr": c.ClientAddr,
-				"miner_addr":  c.MinerAddr,
-				"claim_id":    c.ClaimID,
-				"updated_at":  c.UpdatedAt,
-			},
-			"$set": bson.M{"updated_at": time.Now()},
-		}
+		update := bson.M{"$setOnInsert": c, "$set": bson.M{"updated_at": time.Now()}}
 		res, err := coll.UpdateOne(ctx, filter, update, options.Update().SetUpsert(true))
 		if err != nil {
-			log.Warnw("upsert failed", "provider_id", c.ProviderID, "client_id", c.ClientID, "data_cid", c.DataCID, "err", err)
+			if !mongo.IsDuplicateKeyError(err) {
+				return inserted, err
+			}
 			continue
 		}
 		if res.UpsertedCount > 0 {
@@ -385,28 +423,93 @@ func upsertClaims(ctx context.Context, coll *mongo.Collection, claims []DBClaim)
 	return inserted, nil
 }
 
-/********** 增量主循环 **********/
+// 递归遍历 ExecutionTrace，查找内部调用
+func walkExecTraceForClaims(
+	ctx context.Context,
+	api v1api.FullNode,
+	coll *mongo.Collection,
+	tsk types.TipSetKey,
+	t types.ExecutionTrace,
+) (int64, error) {
+	var total int64
+
+	// 当前节点
+	if t.Msg.To == builtin.VerifiedRegistryActorAddr {
+		ok, _ := isClaimAllocations(ctx, api, t.Msg.To, t.Msg.Method, t.Msg.Params, tsk)
+		if ok {
+			claims, err := parseClaimAllocationsParamsFromDecode(ctx, api, t.Msg.To, t.Msg.Method, t.Msg.Params, tsk)
+			if err != nil {
+				return total, err
+			}
+			n, err := upsertClaims(ctx, coll, claims)
+			if err != nil {
+				return total, err
+			}
+			total += n
+			if n > 0 {
+				log.Infow("ClaimAllocations(inner) inserted", "count", n)
+			}
+		}
+	}
+
+	// 子调用递归
+	for _, child := range t.Subcalls {
+		n, err := walkExecTraceForClaims(ctx, api, coll, tsk, child)
+		if err != nil {
+			return total, err
+		}
+		total += n
+	}
+	return total, nil
+}
+
+// 扫描一个消息（BLS 或 SECP），通过 StateReplay 获取 ExecutionTrace 并递归查找 ClaimAllocations
+func scanOneMessageForClaims(
+	ctx context.Context,
+	api v1api.FullNode,
+	coll *mongo.Collection,
+	tsk types.TipSetKey,
+	msgCid cid.Cid,
+) (int64, error) {
+	tr, err := api.StateReplay(ctx, tsk, msgCid) // v1.23 签名：Replay(ctx, tsk, mcid)
+	if err != nil {
+		return 0, fmt.Errorf("StateReplay: %w", err)
+	}
+	if tr == nil {
+		return 0, nil
+	}
+	return walkExecTraceForClaims(ctx, api, coll, tsk, tr.ExecutionTrace)
+}
+
+/********** 增量主循环（按高度） **********/
+type incCfg struct {
+	PollEvery       time.Duration // 轮询间隔（<30s，含抖动）
+	SafeDelay       int64         // 与链头保持的安全延迟（避免重组）
+	BackfillStart   int64         // 没有 last_height 时，向后回补的高度窗口
+	MaxHeightsBatch int64         // 单轮最多处理的高度数量
+}
+
 func runIncrementalLoop(
 	ctx context.Context,
 	api v1api.FullNode,
 	db *mongo.Database,
 	claimsColl *mongo.Collection,
-	c cfg,
+	cfg incCfg,
 ) {
 	log.Infow("incremental loop start",
-		"poll", c.PollEvery.String(),
-		"safeDelay", c.SafeDelay,
-		"backfill", c.BackfillStart,
-		"batch", c.MaxHeightsBatch,
+		"poll", cfg.PollEvery.String(),
+		"safeDelay", cfg.SafeDelay,
+		"backfill", cfg.BackfillStart,
+		"batch", cfg.MaxHeightsBatch,
 	)
 
-	tick := time.NewTicker(c.PollEvery)
+	tick := time.NewTicker(cfg.PollEvery)
 	defer tick.Stop()
 
 	jitter := func() time.Duration {
 		// -30% ~ +30% 抖动
 		r := (rand.Float64()*0.6 - 0.3)
-		return time.Duration(float64(c.PollEvery) * r)
+		return time.Duration(float64(cfg.PollEvery) * r)
 	}
 
 	for {
@@ -417,13 +520,13 @@ func runIncrementalLoop(
 		case <-tick.C:
 			time.Sleep(jitter())
 
-			head, err := api.ChainHead(ctx)
+			tip, err := api.ChainHead(ctx)
 			if err != nil {
-				log.Warnw("ChainHead", "err", err)
+				log.Warnw("ChainHead failed", "err", err)
 				continue
 			}
-			curH := int64(head.Height())
-			target := curH - c.SafeDelay
+			curH := int64(tip.Height())
+			target := curH - cfg.SafeDelay
 			if target < 0 {
 				continue
 			}
@@ -433,28 +536,29 @@ func runIncrementalLoop(
 				log.Warnw("getLastHeight failed", "err", err)
 				continue
 			}
-
-			start := last + 1
+			var start int64
 			if last == 0 {
-				// 首次无 last_height，从 target - BackfillStart 开始
-				start = target - c.BackfillStart
+				start = target - cfg.BackfillStart
 				if start < 0 {
 					start = 0
 				}
+			} else {
+				start = last + 1
 			}
 			if start > target {
 				continue
 			}
 
 			end := target
-			if c.MaxHeightsBatch > 0 && end-start+1 > c.MaxHeightsBatch {
-				end = start + c.MaxHeightsBatch - 1
+			if cfg.MaxHeightsBatch > 0 && end-start+1 > cfg.MaxHeightsBatch {
+				end = start + cfg.MaxHeightsBatch - 1
 			}
 
-			var processedTo, insertedTotal int64 = last, 0
+			var processedTo = last
+			var deltaInserted int64
 
 			for h := start; h <= end; h++ {
-				ts, err := api.ChainGetTipSetByHeight(ctx, abi.ChainEpoch(h), head.Key())
+				ts, err := api.ChainGetTipSetByHeight(ctx, abi.ChainEpoch(h), tip.Key())
 				if err != nil || ts == nil {
 					log.Warnw("ChainGetTipSetByHeight", "height", h, "err", err)
 					break
@@ -469,72 +573,38 @@ func runIncrementalLoop(
 						continue
 					}
 
+					// Replay 需要消息 CID。api.BlockMessages.Cids 顺序通常是 BLS 在前、SECP 在后。
+					// 保险起见可按顺序对应扫描：
+					idx := 0
 					// BLS
-					for _, m := range bm.BlsMessages {
-						if !isClaimAllocationsCall(m.To, m.Method) {
-							continue
+					for range bm.BlsMessages {
+						if idx >= len(bm.Cids) {
+							break
 						}
-						raw, err := api.StateDecodeParams(ctx, m.To, m.Method, m.Params, ts.Key())
+						cid := bm.Cids[idx]
+						n, err := scanOneMessageForClaims(ctx, api, claimsColl, ts.Key(), cid)
 						if err != nil {
-							log.Warnw("decode params (BLS)", "height", h, "err", err)
-							continue
-						}
-
-						// 转成 JSON string，方便 parseClaimAllocationsParams
-						decBz, err := json.Marshal(raw)
-						if err != nil {
-							log.Warnw("marshal decode params", "height", h, "err", err)
-							continue
-						}
-
-						claims, err := parseClaimAllocationsParams(string(decBz))
-						if err != nil {
-							log.Warnw("parse ClaimAllocations params", "height", h, "err", err)
-							continue
-						}
-						n, err := upsertClaims(ctx, claimsColl, claims)
-						if err != nil {
-							log.Warnw("upsert (BLS)", "height", h, "err", err)
-							continue
+							log.Warnw("replay(BLS) failed", "height", h, "msg", cid.String(), "err", err)
 						}
 						insertedThisHeight += n
+						idx++
 					}
-
 					// SECP
-					for _, sm := range bm.SecpkMessages {
-						m := sm.Message
-						if !isClaimAllocationsCall(m.To, m.Method) {
-							continue
+					for range bm.SecpkMessages {
+						if idx >= len(bm.Cids) {
+							break
 						}
-						raw, err := api.StateDecodeParams(ctx, m.To, m.Method, m.Params, ts.Key())
+						cid := bm.Cids[idx]
+						n, err := scanOneMessageForClaims(ctx, api, claimsColl, ts.Key(), cid)
 						if err != nil {
-							log.Warnw("decode params (BLS)", "height", h, "err", err)
-							continue
-						}
-
-						// 转成 JSON string，方便 parseClaimAllocationsParams
-						decBz, err := json.Marshal(raw)
-						if err != nil {
-							log.Warnw("marshal decode params", "height", h, "err", err)
-							continue
-						}
-
-						claims, err := parseClaimAllocationsParams(string(decBz))
-						if err != nil {
-							log.Warnw("parse ClaimAllocations params", "height", h, "err", err)
-							continue
-						}
-						n, err := upsertClaims(ctx, claimsColl, claims)
-						if err != nil {
-							log.Warnw("upsert (SECP)", "height", h, "err", err)
-							continue
+							log.Warnw("replay(SECP) failed", "height", h, "msg", cid.String(), "err", err)
 						}
 						insertedThisHeight += n
+						idx++
 					}
 				}
 
-				log.Infow("height processed", "height", h, "inserted", insertedThisHeight)
-				insertedTotal += insertedThisHeight
+				deltaInserted += insertedThisHeight
 				processedTo = h
 			}
 
@@ -542,108 +612,107 @@ func runIncrementalLoop(
 				if err := setLastHeight(ctx, db, processedTo); err != nil {
 					log.Warnw("setLastHeight failed", "height", processedTo, "err", err)
 				} else {
-					log.Infow("advance last_height", "to", processedTo, "deltaInserted", insertedTotal)
+					log.Infow("advance last_height", "to", processedTo, "deltaInserted", deltaInserted)
 				}
 			}
 		}
 	}
 }
 
-/********** 启动引导：按需全量，然后增量 **********/
+/********** 启动引导：只在需要时全量，否则直接增量 **********/
 func bootstrapAndStart(
 	ctx context.Context,
 	api v1api.FullNode,
 	db *mongo.Database,
 	claimsColl *mongo.Collection,
-	c cfg,
+	fullOnce func(context.Context, v1api.FullNode, *mongo.Collection) error,
+	inc incCfg,
 ) {
 	done, _ := getFullImportDone(ctx, db)
 
-	// 基于当前 head 初始化 last_height（若未设置）
-	head, err := api.ChainHead(ctx)
+	tip, err := api.ChainHead(ctx)
 	if err != nil {
-		log.Fatal(err)
+		log.Fatalw("ChainHead failed", "err", err)
 	}
-	curH := int64(head.Height())
-	initLast := curH - c.SafeDelay - c.BackfillStart
+	curH := int64(tip.Height())
+	initLast := curH - inc.SafeDelay - inc.BackfillStart
 	if initLast < 0 {
 		initLast = 0
 	}
 
-	if !done {
-		// 判断集合是否为空；空则做全量
-		cnt, err := claimsColl.EstimatedDocumentCount(ctx)
-		if err != nil {
-			log.Fatal(err)
-		}
-		if cnt == 0 {
-			log.Info("claims empty -> running full import once ...")
-			if err := fullImport(ctx, api, claimsColl); err != nil {
-				log.Fatal(err)
-			}
-		} else {
-			log.Infow("claims already populated, skip full import", "estimated_count", cnt)
+	if done {
+		log.Info("full import marked as done, start incremental only")
+		go runIncrementalLoop(ctx, api, db, claimsColl, inc)
+		return
+	}
+
+	cnt, err := claimsColl.EstimatedDocumentCount(ctx)
+	if err != nil {
+		log.Fatalw("count claims failed", "err", err)
+	}
+
+	if cnt == 0 {
+		log.Info("claims empty, running initial full import...")
+		if err := fullOnce(ctx, api, claimsColl); err != nil {
+			log.Fatalw("initial full import failed", "err", err)
 		}
 		if err := setFullImportDone(ctx, db, true); err != nil {
-			log.Warnw("set full_import_done", "err", err)
+			log.Warnw("set full_import_done failed", "err", err)
 		}
-		// 初始化 last_height（如果还没设置）
-		if lh, _ := getLastHeight(ctx, db); lh == 0 {
-			if err := setLastHeight(ctx, db, initLast); err != nil {
-				log.Warnw("init last_height", "height", initLast, "err", err)
-			} else {
-				log.Infow("init last_height", "to", initLast)
-			}
+		if err := setLastHeight(ctx, db, initLast); err != nil {
+			log.Warnw("init last_height failed", "height", initLast, "err", err)
 		}
+		log.Infow("initial full import done", "init_last_height", initLast)
 	} else {
-		// 已标记全量完成：确保 last_height 有值
+		log.Infow("claims already populated, skipping full import",
+			"estimated_count", cnt, "init_last_height", initLast)
+		if err := setFullImportDone(ctx, db, true); err != nil {
+			log.Warnw("set full_import_done failed", "err", err)
+		}
 		if lh, _ := getLastHeight(ctx, db); lh == 0 {
 			if err := setLastHeight(ctx, db, initLast); err != nil {
-				log.Warnw("init last_height", "height", initLast, "err", err)
-			} else {
-				log.Infow("init last_height", "to", initLast)
+				log.Warnw("init last_height failed", "height", initLast, "err", err)
 			}
 		}
 	}
 
-	// 启动增量采集
-	go runIncrementalLoop(ctx, api, db, claimsColl, c)
+	go runIncrementalLoop(ctx, api, db, claimsColl, inc)
 }
 
 /********** main **********/
 func main() {
 	_ = logging.SetLogLevel("*", "info")
 
-	c := loadCfg()
+	cfg := loadCfg()
 	log.Infow("boot",
-		"lotus", maskURLToken(c.LotusURL),
-		"mongo", c.MongoURI,
-		"db", c.MongoDB, "coll", c.MongoColl,
-		"poll", c.PollEvery.String(),
-		"safeDelay", c.SafeDelay,
-		"backfill", c.BackfillStart,
-		"batch", c.MaxHeightsBatch,
+		"lotus", maskURLToken(cfg.LotusURL),
+		"mongo", cfg.MongoURI,
+		"db", cfg.MongoDB, "coll", cfg.MongoColl,
 	)
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
 
 	// lotus
-	full, closeLotus, err := connectLotus(ctx, c.LotusURL, c.LotusJWT)
+	full, closeLotus, err := connectLotus(ctx, cfg.LotusURL, cfg.LotusJWT)
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer closeLotus()
 
 	// mongo
-	mc, claimsColl, err := connectMongo(ctx, c.MongoURI, c.MongoDB, c.MongoColl)
+	mc, claimsColl, err := connectMongo(ctx, cfg.MongoURI, cfg.MongoDB, cfg.MongoColl)
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer mc.Disconnect(ctx)
 
-	// 全量 + 增量
-	bootstrapAndStart(ctx, full, mc.Database(c.MongoDB), claimsColl, c)
+	bootstrapAndStart(ctx, full, mc.Database(cfg.MongoDB), claimsColl, crawlOnce, incCfg{
+		PollEvery:       15 * time.Second, // < 30s，带抖动
+		SafeDelay:       1,                // 与头部保持 1 个 Epoch 安全延迟
+		BackfillStart:   120,              // 无 last_height 时回补约 1h
+		MaxHeightsBatch: 180,              // 单轮最多处理 180 个高度
+	})
 
 	<-ctx.Done()
 	log.Info("shutting down")
