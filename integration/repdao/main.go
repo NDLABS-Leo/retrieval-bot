@@ -41,7 +41,7 @@ func main() {
 	}
 	defer retbotMongo.Disconnect(ctx)
 
-	retbot := retbotMongo.Database(os.Getenv("RESULT_MONGO_DATABASE")).Collection("task_result")
+	retbot := retbotMongo.Database(os.Getenv("RESULT_MONGO_DATABASE")).Collection("claims_task_result")
 
 	// Find the last saved date
 	var lastStats DailyStats

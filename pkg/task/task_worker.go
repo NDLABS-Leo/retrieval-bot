@@ -46,14 +46,14 @@ func NewTaskWorkerProcess(
 		return nil, errors.Wrap(err, "failed to connect to mongo queueDB")
 	}
 
-	taskCollection := taskClient.Database(env.GetRequiredString(env.QueueMongoDatabase)).Collection("task_queue")
+	taskCollection := taskClient.Database(env.GetRequiredString(env.QueueMongoDatabase)).Collection("claims_task_queue")
 
 	resultClient, err := mongo.Connect(ctx, options.Client().ApplyURI(env.GetRequiredString(env.ResultMongoURI)))
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to connect to mongo resultDB")
 	}
 
-	resultCollection := resultClient.Database(env.GetRequiredString(env.ResultMongoDatabase)).Collection("task_result")
+	resultCollection := resultClient.Database(env.GetRequiredString(env.ResultMongoDatabase)).Collection("claims_task_result")
 
 	retrieverInfo := Retriever{
 		PublicIP:  env.GetRequiredString(env.PublicIP),

@@ -73,7 +73,7 @@ func run(c *cli.Context) error {
 	}
 	marketDealsCollection := stateMarketDealsClient.
 		Database(env.GetRequiredString(env.StatemarketdealsMongoDatabase)).
-		Collection("state_market_deals")
+		Collection("claims")
 
 	providerCacheTTL := env.GetDuration(env.ProviderCacheTTL, 24*time.Hour)
 	locationCacheTTL := env.GetDuration(env.LocationCacheTTL, 24*time.Hour)
@@ -128,7 +128,7 @@ func run(c *cli.Context) error {
 		panic(err)
 	}
 	taskCollection := taskClient.
-		Database(env.GetRequiredString(env.QueueMongoDatabase)).Collection("task_queue")
+		Database(env.GetRequiredString(env.QueueMongoDatabase)).Collection("claims_task_queue")
 
 	if len(tasks) > 0 {
 		_, err = taskCollection.InsertMany(ctx, tasks)

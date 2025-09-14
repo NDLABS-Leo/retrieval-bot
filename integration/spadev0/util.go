@@ -62,7 +62,7 @@ func AddSpadeTasks(ctx context.Context, requester string, replicasToTest map[int
 		panic(err)
 	}
 	taskCollection := taskClient.
-		Database(env.GetRequiredString(env.QueueMongoDatabase)).Collection("task_queue")
+		Database(env.GetRequiredString(env.QueueMongoDatabase)).Collection("claims_task_queue")
 
 	if len(tasks) > 0 {
 		_, err = taskCollection.InsertMany(ctx, tasks)
@@ -77,7 +77,7 @@ func AddSpadeTasks(ctx context.Context, requester string, replicasToTest map[int
 	}
 	resultCollection := resultClient.
 		Database(env.GetRequiredString(env.ResultMongoDatabase)).
-		Collection("task_result")
+		Collection("claims_task_result")
 
 	if len(results) > 0 {
 		_, err = resultCollection.InsertMany(ctx, results)

@@ -33,7 +33,7 @@ func main() {
 	}
 	defer retbotMongo.Disconnect(ctx)
 
-	retbot := retbotMongo.Database(os.Getenv("RESULT_MONGO_DATABASE")).Collection("task_result")
+	retbot := retbotMongo.Database(os.Getenv("RESULT_MONGO_DATABASE")).Collection("claims_task_result")
 	repdaoMongo, err := mongo.Connect(ctx, options.Client().ApplyURI(os.Getenv("REPDAO_MONGO_URI")))
 	if err != nil {
 		panic(err)
