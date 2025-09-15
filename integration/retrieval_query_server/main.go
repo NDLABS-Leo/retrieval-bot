@@ -164,7 +164,7 @@ func computeAndStoreClientMiner(ctx context.Context) error {
 	defer cur.Close(ctx)
 
 	// 聚合为：client -> []items
-	group := make(map[string][]ClientMinerItem, 4096)
+	group := make(map[string][]ClientMinerItem, 40000)
 	for cur.Next(ctx) {
 		var a aggOut2Keys
 		if err := cur.Decode(&a); err != nil {

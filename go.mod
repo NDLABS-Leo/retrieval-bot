@@ -23,6 +23,7 @@ require (
 	github.com/klauspost/compress v1.16.0
 	github.com/libp2p/go-libp2p v0.26.4
 	github.com/multiformats/go-multiaddr v0.9.0
+	github.com/multiformats/go-multistream v0.4.1
 	github.com/pkg/errors v0.9.1
 	github.com/redis/go-redis/v9 v9.13.0
 	github.com/rjNemo/underscore v0.6.1
@@ -177,7 +178,6 @@ require (
 	github.com/multiformats/go-multibase v0.1.1 // indirect
 	github.com/multiformats/go-multicodec v0.8.1 // indirect
 	github.com/multiformats/go-multihash v0.2.1 // indirect
-	github.com/multiformats/go-multistream v0.4.1 // indirect
 	github.com/multiformats/go-varint v0.0.7 // indirect
 	github.com/nkovacs/streamquote v1.0.0 // indirect
 	github.com/onsi/ginkgo/v2 v2.8.4 // indirect

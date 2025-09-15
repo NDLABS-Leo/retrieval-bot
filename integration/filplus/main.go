@@ -295,7 +295,7 @@ func getDealsGroupedByClientProvider(collection *mongo.Collection) (map[string]m
 	logger.With("scanned", len(deals), "elapsed", time.Since(stageStart)).Info("claims scanned")
 
 	groupStart := time.Now()
-	grouped := make(map[string]map[string][]model.DBClaim, 20000)
+	grouped := make(map[string]map[string][]model.DBClaim, 200000)
 	for _, d := range deals {
 		if d.ClientAddr == "" || d.MinerAddr == "" {
 			continue
